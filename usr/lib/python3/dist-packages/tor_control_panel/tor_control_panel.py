@@ -368,6 +368,7 @@ class TorControlPanel(QDialog):
         self.proxy_pwd_label.setText('Password: ')
         self.proxy_pwd_label.hide()
         self.proxy_pwd_edit.setPlaceholderText('Optional')
+        self.proxy_pwd_edit.setEchoMode(QLineEdit.Password)
         self.proxy_pwd_edit.hide()
         self.proxy_pwd_edit.setEnabled(False)
 
@@ -458,7 +459,7 @@ class TorControlPanel(QDialog):
 
         if bootstrap_phase == 'no_controller':
             if hasattr(self, 'bootstrap_thread'):
-                self.bootstrap_thread.terminate()
+               self._cleanup_bootstrap_thread()
             self.tor_status = 'no_controller'
             self.message = info.no_controller()
             self.bootstrap_progress.hide()
@@ -467,18 +468,18 @@ class TorControlPanel(QDialog):
             self.refresh_status()
 
         elif bootstrap_phase == 'socket_error':
-            self.bootstrap_thread.terminate()
+            self._cleanup_bootstrap_thread()
             self.message = info.socket_error()
             self.bootstrap_progress.hide()
             self.control_box.setEnabled(True)
             self.refresh_status()
 
         elif bootstrap_phase == 'cookie_authentication_failed':
-            self.bootstrap_thread.terminate()
-            self.message = info.cookie_error()
-            self.bootstrap_progress.hide()
-            self.control_box.setEnabled(True)
-            self.refresh_status()
+           self._cleanup_bootstrap_thread()
+           self.message = info.cookie_error()
+           self.bootstrap_progress.hide()
+           self.control_box.setEnabled(True)
+           self.refresh_status()
 
     def start_bootstrap(self):
         self.bootstrap_thread = tor_bootstrap.TorBootstrap(self)
@@ -701,8 +702,10 @@ class TorControlPanel(QDialog):
                 # warnings and errors, write to file for text browser.
                 elif button.text() == self.button_name[1]:
                     if os.path.exists(self.tor_log):
-                        lines = os.popen('tail -n 3000 %s' % self.tor_log).read()
-                        lines = lines.split('\n')
+                        # Secure subprocess call replacing os.popen
+                        p = Popen(['tail', '-n', '3000', self.tor_log], stdout=PIPE)
+                        stdout, _ = p.communicate()
+                        lines = stdout.decode('utf-8', errors='ignore').split('\n')
                         with open(self.tor_log_html, 'w') as fw:
                             for line in lines:
                                 line = line + '\n'
@@ -799,7 +802,7 @@ class TorControlPanel(QDialog):
 
     def restart_tor(self):
         if not self.bootstrap_done:
-            self.bootstrap_thread.terminate()
+            self._cleanup_bootstrap_thread()
         ## if running restart tor directly stem returns
         ## bootstrap_percent 100 or a socket error, randomly.
         self.stop_tor()
@@ -813,7 +816,7 @@ class TorControlPanel(QDialog):
         self.restart_button.setEnabled(True)
         if not self.bootstrap_done:
             self.bootstrap_progress.hide()
-            self.bootstrap_thread.terminate()
+            self._cleanup_bootstrap_thread()
         stop_command = 'leaprun acw-tor-control-stop'
         p = Popen(stop_command, shell=True)
         p.wait()
@@ -821,9 +824,19 @@ class TorControlPanel(QDialog):
 
     def quit(self):
         if not self.bootstrap_done:
-            self.bootstrap_thread.terminate()
+            self._cleanup_bootstrap_thread()
         self.accept()
 
+    def _cleanup_bootstrap_thread(self):
+        """Gracefully shutdown the bootstrap thread to prevent UI deadlocks."""
+        if hasattr(self, 'bootstrap_thread') and self.bootstrap_thread and self.bootstrap_thread.isRunning():
+            self.bootstrap_thread.quit()
+            # Wait up to 2 seconds for graceful exit, force kill only if hung
+            if not self.bootstrap_thread.wait(2000):
+                print("WARNING: Bootstrap thread hung. Forcing termination.", file=sys.stderr)
+                self.bootstrap_thread.terminate()
+                self.bootstrap_thread.wait()
+            self.bootstrap_thread = None
 
 def signal_handler(sig, frame):
     sys.exit(128 + sig)
