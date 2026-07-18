@@ -175,7 +175,7 @@ class BridgesWizardPage(QWizardPage):
         self.bridges = Common.bridges
 
         self.valid_custom_bridges = QMessageBox(QMessageBox.Warning, 'Warning',
-                                                    info.invalid_custom_bridges(), QMessageBox.Ok)
+                                                info.invalid_custom_bridges(), QMessageBox.Ok)
 
         self.title_frame = QFrame()
         self.title_layout = QGridLayout(self.title_frame)
@@ -447,6 +447,7 @@ class ProxyWizardPage(QWizardPage):
 
         self.password_label.setText('  Password: ')
         self.password_edit.setPlaceholderText('Optional')
+        self.password_edit.setEchoMode(QLineEdit.Password) # Patched: Credential masking
         self.password_edit.setMaximumWidth(250)
         self.password_edit.setMaximumHeight(25)
 
@@ -632,13 +633,6 @@ class AnonConnectionWizard(QWizard):
     def __init__(self):
         super(AnonConnectionWizard, self).__init__()
 
-        """
-        Rationalize code.
-        If torrc_file_path does not exist, write a torrc template at the start of the app.
-        Therefore repair_torrc.py in no longer needed, as well as tor_config_sane
-        Since we are confident that a torrc file exists,  we can avoid all the
-        " if os.path.exists(self.torrc_file_path):" in the whole package.
-        """
         if os.path.exists(Common.torrc_file_path):
             pass
         else:
@@ -666,6 +660,7 @@ class AnonConnectionWizard(QWizard):
         self.proxy_type = ''
         self.tor_status = ''
         self.bootstrap_done = False
+        self.bootstrap_thread = None
 
         self.reply = None
         self.tor_status_result = None
@@ -688,8 +683,6 @@ class AnonConnectionWizard(QWizard):
         Common.use_proxy = not Common.proxy_type == 'None'
 
         if Common.use_custom_bridges:
-        # Retrieve custom bridges
-            # if os.path.exists(Common.torrc_file_path):
             with open(Common.torrc_file_path, 'r') as f:
                 if '# Custom' in f.read():
                     self.bridge_wizard_page.custom_bridges.clear()
@@ -697,14 +690,8 @@ class AnonConnectionWizard(QWizard):
                     lines = f.readlines()
                     for line in lines:
                         if line.startswith('Bridge'):
-                            ## The '[6:]' trims off the first 6 characters of
-                            ## the string, i.e. the substring 'Bridge'.
-                            ##
-                            ## TODO: Is there a space here we should be
-                            ## trimming off too?
                             line = line.strip('\n')[6:]
                             self.bridge_wizard_page.custom_bridges.append(line)
-            f.close()
             self.bridge_wizard_page.custom_bridges.moveCursor(QtGui.QTextCursor.Start)
 
         if Common.use_default_bridges or Common.use_custom_bridges:
@@ -720,7 +707,6 @@ class AnonConnectionWizard(QWizard):
         self.setup_ui()
 
     def setup_ui(self):
-        # Retrieve previous settings
         self.bridge_wizard_page.bridges_frame.setVisible(self.bridge_wizard_page.bridges_checkbox.isChecked())
 
         self.setWindowIcon(QtGui.QIcon("/usr/share/anon-connection-wizard/advancedsettings.ico"))
@@ -741,6 +727,17 @@ class AnonConnectionWizard(QWizard):
         self.button(QWizard.CancelButton).setText('Quit')
         self.exec_()
 
+    def _cleanup_bootstrap_thread(self):
+        """Gracefully shutdown the bootstrap thread to prevent UI deadlocks."""
+        if hasattr(self, 'bootstrap_thread') and self.bootstrap_thread and self.bootstrap_thread.isRunning():
+            self.bootstrap_thread.quit()
+            # Wait up to 2 seconds for graceful exit, force kill only if hung
+            if not self.bootstrap_thread.wait(2000):
+                print("WARNING: Bootstrap thread hung. Forcing termination.", file=sys.stderr)
+                self.bootstrap_thread.terminate()
+                self.bootstrap_thread.wait()
+            self.bootstrap_thread = None
+
     def update_bootstrap(self, bootstrap_phase, bootstrap_percent):
         self.tor_status_page.bootstrap_progress.setValue(bootstrap_percent)
         if bootstrap_percent == 100:
@@ -753,14 +750,14 @@ class AnonConnectionWizard(QWizard):
                                               .format(bootstrap_phase))
 
         if bootstrap_phase == 'no_controller':
-            self.bootstrap_thread.terminate()
+            self._cleanup_bootstrap_thread() # Patched
             buttonReply = QMessageBox.warning(self, 'Tor Controller Not Constructed', 'Tor controller \
                                               cannot be constructed.')
             if buttonReply == QMessageBox.Ok:
                 sys.exit(1)
 
         elif bootstrap_phase == 'cookie_authentication_failed':
-            self.bootstrap_thread.terminate()
+            self._cleanup_bootstrap_thread() # Patched
             buttonReply = QMessageBox(QMessageBox.Warning, 'Tor Controller Authentication Failed', '''Tor allows
                                               for authentication by reading it a cookie file, but we cannot read
                                               that file (probably due to permissions)''', QMessageBox.Ok)
@@ -786,7 +783,9 @@ class AnonConnectionWizard(QWizard):
                 else:
                     self.torrc_page.bridge_text.setText(Common.bridge_type)
 
-                torrc_text = open(Common.torrc_file_path).read()
+                # Patched: Secure File Open Context
+                with open(Common.torrc_file_path, 'r') as f:
+                    torrc_text = f.read()
                 self.torrc_page.torrc_text.setPlainText(torrc_text)
 
             if not Common.use_proxy:
@@ -808,14 +807,12 @@ class AnonConnectionWizard(QWizard):
             self.button(QWizard.CancelButton).show()
             self.button(QWizard.FinishButton).hide()
 
-            '''Arranging different tor_status_page according to the value of disable_tor.'''
             if not Common.disable_tor:
-                # if os.path.exists(Common.torrc_file_path):
-                ## Move the tmp file to the real .conf only when user
-                ## clicks the connect button. This may overwrite the
-                ## previous .conf, but it does not matter.
                 cat(Common.acw_comm_file_path)
-                content = open(Common.torrc_file_path).read()
+                
+                # Patched: Secure File Open Context
+                with open(Common.torrc_file_path, 'r') as f:
+                    content = f.read()
                 write_to_temp_then_move(content)
 
                 self.tor_status_page.bootstrap_progress.show()
@@ -845,7 +842,6 @@ class AnonConnectionWizard(QWizard):
                 else:
                     print('Unexpected tor_status: ' + self.tor_status + '\n' +
                           "Error Code: " + self.tor_status_code, file=sys.stderr)
-                    # display error message on GUI
                     self.tor_status_page.bootstrap_progress.hide()
                     self.tor_status_page.text.setText('<p><b>Unexpected Exception.</b></p> \
                         <p>You may not be able to use any network facing application for now.</p> \
@@ -891,38 +887,27 @@ class AnonConnectionWizard(QWizard):
         torrc_gen.gen_torrc(args)
 
     def back_button_clicked(self):
-        try:
-            if self.bootstrap_thread:
-                self.bootstrap_thread.terminate()
-                self.bootstrap_thread = False
+        self._cleanup_bootstrap_thread() # Patched
 
-                if Common.init_tor_status == 'tor_enabled':
-                    pass
-                elif Common.init_tor_status == 'tor_disabled':
-                    tor_status.set_disabled()
-
-        except AttributeError:
+        if Common.init_tor_status == 'tor_enabled':
             pass
+        elif Common.init_tor_status == 'tor_disabled':
+            tor_status.set_disabled()
 
         self.bootstrap_done = False
         self.button(QWizard.FinishButton).hide()
         self.button(QWizard.CancelButton).show()
 
     def cancel_button_clicked(self):
-        if self.bootstrap_thread:
-            self.bootstrap_thread.terminate()
-            tor_status.set_disabled()
+        self._cleanup_bootstrap_thread() # Patched
+        tor_status.set_disabled()
 
-        # recover Tor to the initial status before the starting of anon_connection_wizard
         if Common.init_tor_status == 'tor_enabled':
             pass
         elif Common.init_tor_status == 'tor_disabled':
             tor_status.set_disabled()
 
     def finish_button_clicked(self):
-        # The True indicates the acw has finished successfully
-        # TODO: this does not work as expected; even when the cancel button is clicked,
-        # the wizard still return True
         return True
 
     def show_finish_button(self):
@@ -942,8 +927,6 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    # Available styles: "windows", "motif", "cde", "sgi", "plastique" and "cleanlooks"
-    # TODO: use customized css instead. Take Tor Launcher's css as a reference
     QApplication.setStyle('plastique')
 
     AnonConnectionWizard()
